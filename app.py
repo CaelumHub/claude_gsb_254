@@ -20,7 +20,7 @@ if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 from pipeline import PipelineEngine          # noqa: E402
-from storage import StoreRegistry             # noqa: E402
+from storage import StoreRegistry, EntityRegistry, ShardedStore  # noqa: E402
 from web import api                           # noqa: E402
 
 
@@ -33,9 +33,13 @@ def create_app(data_root: str | None = None) -> Flask:
 
     # 应用级单例，供蓝图通过 current_app.config 访问
     registry = StoreRegistry(data_root, shard_size=100)
+    # 实体提及落在普通分片存储，规范对象落在实体注册表
+    mention_store = ShardedStore(data_root, "entity_mention", shard_size=100)
+    entity_registry = EntityRegistry(data_root, mention_store)
     engine = PipelineEngine().register_builtin()
     app.config["DATA_ROOT"] = data_root
     app.config["STORE_REGISTRY"] = registry
+    app.config["ENTITY_REGISTRY"] = entity_registry
     app.config["PIPELINE_ENGINE"] = engine
     app.config["JSON_AS_ASCII"] = False
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from nlp import (get_keywords, get_ner, get_parser, get_segmenter,
                  get_sentiment, get_summarizer, get_tagger, get_translator,
-                 get_constituency_parser)
+                 get_constituency_parser, get_linker)
 from nlp.lexicon import STOPWORDS
 
 from .stage import Stage
@@ -38,6 +38,14 @@ def _ner(ctx, params):
     ner = get_ner()
     text = ctx.get("clean_text") or ctx.get("text", "")
     return {"ner": ner.recognize(text)}
+
+
+def _entity_linking(ctx, params):
+    """实体链接/语义消歧：结合搭配、行业词、共现实体判断「当前这句是谁」。"""
+    text = ctx.get("clean_text") or ctx.get("text", "")
+    ner_result = ctx.get("ner")
+    linked = get_linker().link(text, entities=ner_result)
+    return {"entity_linking": linked}
 
 
 def _sentiment(ctx, params):
@@ -79,6 +87,9 @@ BUILTIN_STAGES = [
           description="词性标注"),
     Stage("ner", _ner, inputs=["text", "clean_text"], outputs=["ner"],
           description="命名实体识别"),
+    Stage("entity_linking", _entity_linking,
+          inputs=["text", "clean_text", "ner"], outputs=["entity_linking"],
+          description="实体链接与语义消歧（判断当前语境指向哪个真实对象）"),
     Stage("sentiment", _sentiment, inputs=["text", "clean_text"], outputs=["sentiment"],
           description="情感分析"),
     Stage("keywords", _keywords, inputs=["text", "clean_text"], outputs=["keywords"],

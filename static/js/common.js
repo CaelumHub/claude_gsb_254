@@ -7,6 +7,7 @@ const PAGES = [
   { file: "segment.html",   name: "分词与词性标注", desc: "切词 + POS" },
   { file: "parse.html",     name: "句法分析树",   desc: "依存 / 成分树" },
   { file: "ner.html",       name: "命名实体识别", desc: "NER 与标注" },
+  { file: "entity.html",    name: "实体链接与对齐", desc: "消歧 / 跨文档聚合" },
   { file: "sentiment.html", name: "情感分析",     desc: "正负面分类" },
   { file: "summary.html",   name: "文本摘要",     desc: "抽取式摘要" },
   { file: "translate.html", name: "机器翻译",     desc: "模拟翻译" },
@@ -17,7 +18,8 @@ const PAGES = [
 
 const PAGE_NAMES = {
   corpus: "语料库管理", segment: "分词与词性标注", parse: "句法分析树",
-  ner: "命名实体识别", sentiment: "情感分析", summary: "文本摘要",
+  ner: "命名实体识别", entity: "实体链接与跨文档对齐", sentiment: "情感分析",
+  summary: "文本摘要",
   translate: "机器翻译", keywords: "关键词提取", embedding: "词向量可视化",
   pipeline: "流水线配置与执行",
 };
@@ -32,6 +34,21 @@ const TAG_NAMES = {
 const ENTITY_NAMES = {
   PERSON: "人名", LOCATION: "地名", ORGANIZATION: "机构", TIME: "时间",
   DATE: "日期", NUMBER: "数字", MONEY: "金额", PERCENT: "百分比",
+};
+
+// 语义细类（实体链接用）
+const SEMANTIC_NAMES = {
+  PERSON: "人物", ORG: "组织机构", COMPANY: "企业/公司", GOV: "政府机构",
+  SCHOOL: "学校/科研", LOCATION: "地点/地区", NATURAL: "自然地理",
+  PRODUCT: "产品/品牌型号", FOOD: "食物/农产品", PLANT: "植物",
+  ANIMAL: "动物", WORK: "作品/影视", OTHER: "其他", PENDING: "待定",
+};
+
+// 提及链接状态
+const LINK_STATUS = {
+  LINKED: ["已链接", "green"], RESOLVED: ["已对齐", "blue"],
+  KB_PENDING: ["待定", "amber"], UNKNOWN: ["未收录", "amber"],
+  PENDING: ["待定", "amber"],
 };
 
 const DEP_REL_NAMES = {

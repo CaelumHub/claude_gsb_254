@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>实体链接与对齐 - NLP 流水线平台</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <style>
+    .ent-sem { padding: 1px 7px; border-radius: 10px; font-size: 12px;
+      border: 1px solid var(--border); background: var(--surface-2); }
+    .ent-mention { cursor: pointer; }
+    .ent-mention:hover { outline: 2px solid var(--primary); }
+    .ev-tag { font-size: 11px; color: var(--text-muted); background: var(--surface-2);
+      border: 1px solid var(--border); border-radius: 4px; padding: 0 6px; margin: 1px;
+      display: inline-block; }
+    .mini { font-size: 12px; color: var(--text-muted); }
+    .stat-num { font-size: 22px; font-weight: 700; color: var(--primary); }
+    .row-wrap { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="site-sidebar"></aside>
+
+  <main class="main">
+    <h1 class="page-title">实体链接与跨文档对齐</h1>
+    <p class="page-desc">结合搭配、行业词、上下文实体判断「当前这句指谁」，并把散落在多篇文档中的同一对象聚到同一稳定 ID 下；同名不同对象不会混淆，判不了标「待定」。</p>
+
+    <!-- 统计 -->
+    <div class="grid cols-4 mb" id="stats"></div>
+
+    <div class="grid cols-2">
+      <!-- 左：单篇消歧 + 入库 -->
+      <section class="card">
+        <h2>语境消歧</h2>
+        <textarea id="text" rows="4">苹果今年发布了搭载自研芯片的新手机，财报营收创新高；而果农种的苹果一斤五块钱又甜又脆。</textarea>
+        <div class="toolbar mt">
+          <button class="btn" id="btn-link">仅消歧</button>
+          <button class="btn secondary" id="btn-ingest">消歧并入库</button>
+          <select id="sample" class="small" style="max-width:200px"></select>
+        </div>
+        <div id="highlight" class="output plain mt"
+             style="font-size:15px;line-height:2.1;min-height:60px"></div>
+        <div id="link-list" class="mt"></div>
+      </section>
+
+      <!-- 右：批量入库 + 待定 -->
+      <section class="card">
+        <h2>批量入库与待定队列</h2>
+        <p class="muted small">对语料库全部文档执行实体对齐；新文档持续入库时，已确定的对象关系保持稳定。</p>
+        <div class="toolbar">
+          <button class="btn" id="btn-batch">批量对齐全部语料</button>
+          <button class="btn secondary" id="btn-resolve">重新解析待定</button>
+          <button class="btn secondary small" id="btn-refresh">刷新</button>
+        </div>
+        <h3 class="mt">待定提及（<span id="pending-count">0</span>）</h3>
+        <div id="pending-list" class="muted small">加载中…</div>
+      </section>
+    </div>
+
+    <!-- 规范实体目录 -->
+    <section class="card mt">
+      <div class="toolbar">
+        <h2 style="margin:0;flex:1">规范实体目录</h2>
+        <input type="text" id="search" placeholder="按名字/别名搜索" style="max-width:200px">
+        <select id="filter-type"><option value="">全部类型</option></select>
+      </div>
+      <div id="entity-list" class="muted">加载中…</div>
+    </section>
+  </main>
+</div>
+
+<!-- 实体详情弹层 -->
+<div id="modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:100;overflow:auto">
+  <div class="card" style="max-width:760px;margin:40px auto">
+    <div class="toolbar">
+      <h2 style="margin:0;flex:1" id="m-title">实体详情</h2>
+      <button class="btn secondary small" id="m-close">关闭</button>
+    </div>
+    <div id="m-body" class="mt"></div>
+  </div>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script>
+renderNav("entity.html");
+
+const SAMPLES = [
+  "苹果今年发布了搭载自研芯片的新手机，财报营收创新高；果农种的苹果一斤五块钱又甜又脆。",
+  "小米创始人雷军宣布新机下周发布；奶奶用小米和大米熬粥，说是养胃的杂粮。",
+  "亚马逊河流域分布着广阔的热带雨林；亚马逊公司的云计算业务营收持续增长。",
+  "山里的杜鹃清晨鸣叫，是一种巢寄生的鸟；院中的杜鹃花正盛开。",
+  "红星科技公司发布了新一代AI芯片，财报亮眼；红星农产品公司的苹果今年丰收。",
+  "苹果和小米都是常见的词，没有更多上下文。",
+];
+$("#sample").innerHTML = SAMPLES.map((s, i) =>
+  `<option value="${i}">示例 ${i + 1}</option>`).join("");
+$("#sample").addEventListener("change", e => { $("#text").value = SAMPLES[e.target.value]; });
+
+function semBadge(t) {
+  return `<span class="ent-sem">${esc(SEMANTIC_NAMES[t] || t)}</span>`;
+}
+function statusBadge(s) {
+  const [name, cls] = LINK_STATUS[s] || [s, ""];
+  return `<span class="badge ${cls}">${name}</span>`;
+}
+
+/* ---------- 单篇消歧 ---------- */
+function renderLinked(text, entities) {
+  const sorted = entities.slice().sort((a, b) => a.start - b.start);
+  let html = "", last = 0;
+  for (const e of sorted) {
+    html += esc(text.slice(last, e.start));
+    const color = e.status === "LINKED" ? "#16a34a"
+      : (e.status === "RESOLVED" ? "#4f46e5" : "#d97706");
+    const title = `${SEMANTIC_NAMES[e.sem_type] || e.sem_type}｜${e.name || "待定"}｜置信度 ${e.confidence}`;
+    html += `<span class="ent-mention" style="border-bottom:2px solid ${color};border-radius:3px" title="${esc(title)}">${esc(text.slice(e.start, e.end))}</span>`;
+    last = e.end;
+  }
+  html += esc(text.slice(last));
+  $("#highlight").innerHTML = html;
+
+  $("#link-list").innerHTML = entities.length
+    ? `<h3>识别与判定（${entities.length}）</h3>` + entities.map(e => `
+      <div class="list-item" style="margin:6px 0">
+        <div class="meta">
+          <div class="name row-wrap">
+            <strong>${esc(e.text)}</strong> ${semBadge(e.sem_type)} ${statusBadge(e.status)}
+            <span class="mini">${e.name ? "→ " + esc(e.name) : "未确定对象"} · 置信度 ${e.confidence}${e.industry ? " · " + esc(e.industry) : ""}</span>
+          </div>
+          <div class="sub mt">${(e.evidence || []).map(x => `<span class="ev-tag">${esc(x)}</span>`).join("") || '<span class="mini">无明显线索</span>'}</div>
+        </div>
+      </div>`).join("")
+    : '<div class="muted">未识别到可链接实体。</div>';
+}
+
+async function doLink(persist) {
+  const text = $("#text").value.trim();
+  if (!text) return toast("请输入文本", "err");
+  const btn = persist ? $("#btn-ingest") : $("#btn-link");
+  setLoading(btn, true, persist ? "入库中…" : "消歧中…");
+  try {
+    const r = await api(persist ? "/api/entity/ingest" : "/api/entity/link",
+      { method: "POST", body: { text } });
+    renderLinked(text, r.entities);
+    if (persist) {
+      const s = r.stats;
+      toast(`已入库：对齐 ${s.resolved}，待定 ${s.pending}`);
+      loadAll();
+    }
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+}
+$("#btn-link").addEventListener("click", () => doLink(false));
+$("#btn-ingest").addEventListener("click", () => doLink(true));
+
+/* ---------- 批量 ---------- */
+$("#btn-batch").addEventListener("click", async () => {
+  const btn = $("#btn-batch");
+  setLoading(btn, true, "批量对齐中…");
+  try {
+    const r = await api("/api/entity/ingest_corpus", { method: "POST", body: {} });
+    toast(`已处理 ${r.doc_count} 篇：对齐 ${r.resolved}，待定 ${r.pending}`);
+    loadAll();
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+});
+$("#btn-resolve").addEventListener("click", async () => {
+  const r = await api("/api/entity/resolve_pending",
+    { method: "POST", body: { limit: 1000 } });
+  toast(`重解析 ${r.checked}：归位 ${r.resolved + r.created}，仍待定 ${r.still_pending}`);
+  loadAll();
+});
+
+/* ---------- 统计 ---------- */
+async function loadStats() {
+  const s = (await api("/api/entity/stats"));
+  const cards = [
+    ["规范对象", s.entity_count],
+    ["提及总数", s.mention_count],
+    ["知识库锚点", s.kb_anchored],
+    ["待定对象", s.pending_entity_count],
+  ];
+  $("#stats").innerHTML = cards.map(([n, v]) => `
+    <section class="card" style="padding:16px">
+      <div class="stat-num">${v}</div><div class="mini">${n}</div>
+    </section>`).join("");
+}
+
+/* ---------- 实体目录 ---------- */
+async function loadEntities() {
+  const type = $("#filter-type").value;
+  const q = $("#search").value.trim();
+  const qs = new URLSearchParams();
+  if (type) qs.set("sem_type", type);
+  if (q) qs.set("q", q);
+  const r = await api(`/api/entity?${qs}`);
+  const list = $("#entity-list");
+  if (!r.entities.length) { list.innerHTML = '<span class="muted">暂无实体</span>'; return; }
+  list.innerHTML = r.entities.map(e => `
+    <div class="list-item" style="cursor:pointer" onclick="openEntity('${e.id}')">
+      <div class="meta">
+        <div class="name row-wrap">
+          <span class="badge blue">${e.id}</span>
+          <strong>${esc(e.canonical)}</strong>
+          ${semBadge(e.sem_type)}
+          ${e.kb_id ? '<span class="badge green">知识库</span>' : ""}
+          ${e.status === "PENDING" ? '<span class="badge amber">待定</span>' : ""}
+        </div>
+        <div class="sub">
+          提及 ${e.mention_count} 次
+          ${(e.aliases || []).length ? " · 别名：" + esc(e.aliases.join("、")) : ""}
+          ${(e.industries || []).length ? " · 行业：" + esc(e.industries.join("/")) : ""}
+        </div>
+      </div>
+    </div>`).join("");
+}
+$("#search").addEventListener("input", () => loadEntities());
+$("#filter-type").addEventListener("change", loadEntities);
+
+/* ---------- 待定列表 ---------- */
+async function loadPending() {
+  const r = await api("/api/entity/mentions/pending?limit=50");
+  $("#pending-count").textContent = r.count;
+  const box = $("#pending-list");
+  if (!r.mentions.length) { box.innerHTML = '<span class="muted">没有待定提及</span>'; return; }
+  box.innerHTML = r.mentions.map(m => `
+    <div class="list-item" style="margin:4px 0">
+      <div class="meta">
+        <div class="name row-wrap">
+          <strong>${esc(m.surface)}</strong>
+          ${m.sem_type && m.sem_type !== "PENDING" ? semBadge(m.sem_type) : ""}
+          ${m.industry ? `<span class="ev-tag">${esc(m.industry)}</span>` : ""}
+          <span class="mini">${esc((m.text || "").slice(0, 30))}…</span>
+        </div>
+        <div class="sub mt">
+          ${(m.evidence || []).map(x => `<span class="ev-tag">${esc(x)}</span>`).join("")}
+          <a href="#" onclick="manualAssign('${m.id}');return false">人工指定/新建</a>
+        </div>
+      </div>
+    </div>`).join("");
+}
+
+async function manualAssign(mid) {
+  const name = prompt("新建对象的规范名（留空则输入要挂靠的现有实体 ID，如 E000001）：");
+  if (name === null) return;
+  try {
+    const body = name && !/^E\d{6}$/.test(name)
+      ? { name } : { entity_id: name || undefined };
+    await api(`/api/entity/mentions/${mid}/assign`, { method: "POST", body });
+    toast("已指定");
+    loadAll();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+/* ---------- 详情 / 合并 / 拆分 ---------- */
+async function openEntity(eid) {
+  const r = await api(`/api/entity/${eid}`);
+  const e = r.entity;
+  $("#m-title").textContent = `${e.id} · ${e.canonical}`;
+  const mentions = r.mentions.map(m => `
+    <tr>
+      <td><input type="checkbox" class="m-pick" value="${esc(m.id)}"
+        ${m.entity_id === e.id ? "" : "disabled"}></td>
+      <td>${esc(m.surface)}</td>
+      <td>${esc(m.doc_id || "")}</td>
+      <td>${esc((m.text || "").slice(0, 34))}…</td>
+      <td>${statusBadge(m.status)}</td>
+    </tr>`).join("");
+  $("#m-body").innerHTML = `
+    <div class="row-wrap mb">
+      ${semBadge(e.sem_type)}
+      ${e.kb_id ? `<span class="badge green">${esc(e.kb_id)}</span>` : ""}
+      <span class="mini">提及 ${e.mention_count} 次 · 行业 ${esc((e.industries || []).join("/") || "—")}</span>
+    </div>
+    <div class="mini mb">别名：${esc((e.aliases || []).join("、") || "—")}</div>
+    <div class="mini mb">共现画像：${esc((e.context_entities || []).join("、") || "—")}</div>
+    <div class="toolbar mt">
+      <input type="text" id="merge-target" placeholder="并入目标 ID，如 E000002" style="max-width:200px">
+      <button class="btn small" id="btn-merge">合并到该对象</button>
+      <button class="btn secondary small" id="btn-split">把勾选提及拆为新对象</button>
+    </div>
+    <table class="mt" style="width:100%;font-size:13px;border-collapse:collapse">
+      <thead><tr style="text-align:left;color:var(--text-muted)">
+        <th></th><th>字串</th><th>文档</th><th>语境</th><th>状态</th>
+      </tr></thead><tbody>${mentions}</tbody></table>`;
+  $("#modal").style.display = "block";
+
+  $("#btn-merge").onclick = async () => {
+    const target = $("#merge-target").value.trim();
+    if (!target) return toast("请输入目标 ID", "err");
+    if (!confirm(`确认把 ${e.id} 合并进 ${target}？（旧 ID 将永久重定向）`)) return;
+    try { await api("/api/entity/merge",
+      { method: "POST", body: { source_id: e.id, target_id: target } });
+      toast("已合并"); closeModal(); loadAll();
+    } catch (err) { toast(err.message, "err"); }
+  };
+  $("#btn-split").onclick = async () => {
+    const ids = Array.from(document.querySelectorAll(".m-pick:checked")).map(x => x.value);
+    if (!ids.length) return toast("请勾选要拆出的提及", "err");
+    const name = prompt("新对象的规范名：");
+    if (name === null) return;
+    try { await api(`/api/entity/${e.id}/split`,
+      { method: "POST", body: { mention_ids: ids, name: name || undefined } });
+      toast("已拆分"); closeModal(); loadAll();
+    } catch (err) { toast(err.message, "err"); }
+  };
+}
+function closeModal() { $("#modal").style.display = "none"; }
+$("#m-close").addEventListener("click", closeModal);
+$("#modal").addEventListener("click", e => { if (e.target.id === "modal") closeModal(); });
+
+/* ---------- 初始化 ---------- */
+function loadAll() { loadStats(); loadEntities(); loadPending(); }
+$("#btn-refresh").addEventListener("click", loadAll);
+
+api("/api/meta").then(m => {
+  $("#filter-type").innerHTML = '<option value="">全部类型</option>' +
+    Object.entries(m.semantic_type_names)
+      .map(([id, n]) => `<option value="${id}">${n}</option>`).join("");
+});
+doLink(false);
+loadAll();
+</script>
+</body>
+</html>

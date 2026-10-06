@@ -16,8 +16,10 @@ from flask import Blueprint, current_app, jsonify, request
 
 from nlp import (get_constituency_parser, get_embeddings, get_keywords, get_ner,
                  get_parser, get_segmenter, get_sentiment, get_summarizer,
-                 get_tagger, get_translator, ENTITY_TYPE_NAMES, TAG_NAMES,
-                 DEP_REL_NAMES, PHRASE_NAMES, POLARITY_NAMES)
+                 get_tagger, get_translator, get_linker, ENTITY_TYPE_NAMES,
+                 TAG_NAMES, DEP_REL_NAMES, PHRASE_NAMES, POLARITY_NAMES,
+                 SEMANTIC_TYPE_NAMES)
+from nlp.linking import ENTITY_KB
 from nlp.lexicon import STOPWORDS
 from storage import StoreRegistry
 
@@ -35,6 +37,10 @@ def _registry() -> StoreRegistry:
 
 def _engine():
     return current_app.config["PIPELINE_ENGINE"]
+
+
+def _entity_registry():
+    return current_app.config["ENTITY_REGISTRY"]
 
 
 def _models_dir() -> str:
@@ -110,6 +116,7 @@ def meta():
         "dep_rel_names": DEP_REL_NAMES,
         "phrase_names": PHRASE_NAMES,
         "entity_type_names": ENTITY_TYPE_NAMES,
+        "semantic_type_names": SEMANTIC_TYPE_NAMES,
         "polarity_names": POLARITY_NAMES,
         "directions": [{"id": "zh2en", "name": "中文 → 英文"},
                        {"id": "en2zh", "name": "英文 → 中文"}],
@@ -287,6 +294,175 @@ def ner_annotate():
 def ner_annotations():
     records = _registry().task("annotation").all()
     return jsonify({"annotations": records})
+
+
+# ---------------------------------------------------------------------------
+# 实体链接、语义消歧与跨文档对齐
+# ---------------------------------------------------------------------------
+
+@api.post("/entity/link")
+def entity_link():
+    """仅消歧、不落库：判断当前文本中每个实体属于哪类、指向哪个知识库对象。"""
+    data = _payload()
+    text, cid = _resolve_text(data)
+    if not text:
+        return jsonify({"error": "缺少文本"}), 400
+    linked = get_linker().link(text)
+    return jsonify({
+        "entities": linked,
+        "semantic_type_names": SEMANTIC_TYPE_NAMES,
+        "corpus_id": cid,
+    })
+
+
+@api.post("/entity/ingest")
+def entity_ingest():
+    """对单篇文本消歧并把提及对齐入库（跨文档聚合到规范对象名下）。"""
+    data = _payload()
+    text, cid = _resolve_text(data)
+    if not text:
+        return jsonify({"error": "缺少文本"}), 400
+    source = data.get("source", "manual")
+    linked = get_linker().link(text)
+    stats = _entity_registry().ingest(
+        linked, doc_id=cid, text=text, source=source)
+    return jsonify({"ok": True, "stats": stats,
+                    "entities": linked,
+                    "semantic_type_names": SEMANTIC_TYPE_NAMES})
+
+
+@api.post("/entity/ingest_corpus")
+def entity_ingest_corpus():
+    """批量对语料库文档做实体对齐入库（新文档持续入库，已有关系保持稳定）。"""
+    data = _payload()
+    store = _registry().task("corpus")
+    corpus_ids = data.get("corpus_ids") or []
+    if corpus_ids:
+        records = [store.get(c) for c in corpus_ids]
+        records = [r for r in records if r]
+    else:
+        records = [r for r in store.all() if not r.get("_deleted")]
+    if not records:
+        return jsonify({"error": "没有可处理的语料"}), 400
+
+    linker = get_linker()
+    registry = _entity_registry()
+    total = {"mentions": 0, "resolved": 0, "pending": 0, "created": 0}
+    for rec in records:
+        linked = linker.link(rec.get("text", ""))
+        st = registry.ingest(
+            linked, doc_id=rec.get("id"), text=rec.get("text", ""),
+            source="corpus_batch")
+        for k in total:
+            total[k] += st.get(k, 0)
+    total["doc_count"] = len(records)
+    total["stats"] = registry.stats()
+    return jsonify({"ok": True, **total})
+
+
+@api.get("/entity")
+def entity_list():
+    """列出规范实体（可按语义类型/知识库锚点过滤）。"""
+    registry = _entity_registry()
+    entities = registry.all_entities()
+    sem_type = request.args.get("sem_type")
+    q = request.args.get("q", "").strip()
+    if sem_type:
+        entities = [e for e in entities if e.get("sem_type") == sem_type]
+    if q:
+        entities = [e for e in entities
+                    if q in e.get("canonical", "")
+                    or q in " ".join(e.get("aliases", []))]
+    return jsonify({
+        "entities": entities,
+        "stats": registry.stats(),
+        "semantic_type_names": SEMANTIC_TYPE_NAMES,
+    })
+
+
+@api.get("/entity/stats")
+def entity_stats():
+    return jsonify(_entity_registry().stats())
+
+
+@api.get("/entity/<eid>")
+def entity_detail(eid: str):
+    registry = _entity_registry()
+    entity = registry.get(eid)
+    if not entity:
+        return jsonify({"error": "实体对象不存在"}), 404
+    mentions = registry.list_mentions(entity_id=entity["id"], limit=200)
+    return jsonify({"entity": entity, "mentions": mentions,
+                    "semantic_type_names": SEMANTIC_TYPE_NAMES})
+
+
+@api.get("/entity/mentions/pending")
+def entity_pending_mentions():
+    limit = request.args.get("limit", 100, type=int)
+    mentions = _entity_registry().list_mentions(
+        status="PENDING", limit=limit)
+    return jsonify({"mentions": mentions, "count": len(mentions),
+                    "semantic_type_names": SEMANTIC_TYPE_NAMES})
+
+
+@api.post("/entity/mentions/<mid>/assign")
+def entity_assign_mention(mid: str):
+    """人工把一条待定提及指定给某对象，或按名字新建对象。"""
+    data = _payload()
+    try:
+        result = _entity_registry().assign(
+            mid, entity_id=data.get("entity_id"),
+            create_name=data.get("name"), sem_type=data.get("sem_type"))
+    except KeyError as exc:
+        return jsonify({"error": str(exc)}), 404
+    return jsonify({"ok": True, **result})
+
+
+@api.post("/entity/resolve_pending")
+def entity_resolve_pending():
+    """用最新积累的画像对所有待定提及重新对齐（不改历史、不动已确定 id）。"""
+    data = _payload()
+    limit = int(data.get("limit", 500))
+    return jsonify({"ok": True, **_entity_registry().resolve_pending(limit)})
+
+
+@api.post("/entity/merge")
+def entity_merge():
+    """把一个对象并入另一个（留重定向，旧引用不失效）。"""
+    data = _payload()
+    source, target = data.get("source_id"), data.get("target_id")
+    if not source or not target:
+        return jsonify({"error": "需要 source_id 与 target_id"}), 400
+    try:
+        result = _entity_registry().merge(source, target)
+    except KeyError as exc:
+        return jsonify({"error": str(exc)}), 404
+    return jsonify({"ok": True, **result})
+
+
+@api.post("/entity/<eid>/split")
+def entity_split(eid: str):
+    """把误并的若干提及拆成一个新对象。"""
+    data = _payload()
+    mention_ids = data.get("mention_ids") or []
+    if not mention_ids:
+        return jsonify({"error": "需要 mention_ids"}), 400
+    try:
+        result = _entity_registry().split(
+            eid, mention_ids, new_name=data.get("name"))
+    except (KeyError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"ok": True, **result})
+
+
+@api.get("/entity/kb")
+def entity_kb():
+    """返回内置迷你知识库（歧义名字 -> 候选对象），供前端展示。"""
+    kb = {}
+    for surface, candidates in ENTITY_KB.items():
+        kb[surface] = [{**c, "aliases": sorted(c.get("aliases", ()))}
+                       for c in candidates]
+    return jsonify({"kb": kb})
 
 
 # ---------------------------------------------------------------------------
