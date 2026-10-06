@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>实体消歧与对齐 - NLP 流水线平台</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="site-sidebar"></aside>
+
+  <main class="main">
+    <h1 class="page-title">实体消歧与跨文档对齐</h1>
+    <p class="page-desc">结合搭配词、行业词、上下文实体判断实体指向哪个真实对象；同一对象跨文档聚到同一名下，同名不同对象分开；拿不准一律标「待定」，可人工指派或待证据充足后自动升级。</p>
+
+    <section class="card">
+      <label>输入文本（试试「苹果」在公司 / 水果两种语境）</label>
+      <textarea id="text">苹果公司发布了新款手机，股价大涨。我今天吃了一个苹果，很甜。小米和红枣一起煮粥很有营养。</textarea>
+      <div class="toolbar mt">
+        <button class="btn" id="btn-resolve">消歧并链接</button>
+        <button class="btn secondary" id="btn-ingest">语料库批量入库</button>
+        <span class="muted small" id="ingest-summary"></span>
+      </div>
+    </section>
+
+    <div class="grid cols-2">
+      <section class="card">
+        <h2>消歧结果</h2>
+        <div id="highlight" class="output plain" style="font-size:16px;line-height:2"></div>
+        <div class="mt" id="mention-list"></div>
+      </section>
+
+      <section class="card">
+        <div class="toolbar" style="margin-bottom:10px">
+          <h2 style="margin:0;flex:1">实体库</h2>
+          <button class="btn secondary small" id="btn-ent-refresh">刷新</button>
+        </div>
+        <div id="entity-stats" class="mb muted small">—</div>
+        <div id="entity-list" class="muted">加载中…</div>
+      </section>
+    </div>
+
+    <section class="card" id="entity-detail-card" style="display:none">
+      <h2 id="detail-title">实体详情</h2>
+      <div id="entity-detail"></div>
+    </section>
+
+    <section class="card">
+      <div class="toolbar" style="margin-bottom:10px">
+        <h2 style="margin:0;flex:1">待定队列 <span class="muted small" id="pending-count"></span></h2>
+        <button class="btn secondary small" id="btn-reresolve">用当前知识库重估</button>
+      </div>
+      <p class="muted small">语境证据不足、系统不乱猜的提及会进入待定队列；知识库扩充后可重估升级，也可以人工指派。</p>
+      <div id="pending-list" class="muted">加载中…</div>
+    </section>
+  </main>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script>
+renderNav("entity.html");
+
+let lastText = "", lastMentions = [], allEntities = [];
+
+/* ---------- 消歧演示 ---------- */
+async function doResolve() {
+  const text = $("#text").value.trim();
+  if (!text) return toast("请输入文本", "err");
+  const btn = $("#btn-resolve");
+  setLoading(btn, true, "消歧中…");
+  try {
+    const r = await api("/api/entity/resolve", { method: "POST", body: { text } });
+    lastText = text; lastMentions = r.mentions;
+    renderMentions();
+    loadEntities(); loadPending(); loadStats();
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+}
+
+function renderMentions() {
+  // 高亮：已链接绿色、待定橙色
+  const sorted = lastMentions.slice().sort((a, b) => a.start - b.start);
+  let html = "", last = 0;
+  for (const m of sorted) {
+    html += esc(lastText.slice(last, m.start));
+    const color = m.status === "linked" ? "#22c55e" : "#f59e0b";
+    const title = m.status === "linked"
+      ? `${m.canonical} · ${ENTITY_SENSE_NAMES[m.sense_type] || ""} · 置信度 ${m.confidence}`
+      : "待定：证据不足，未做猜测";
+    html += `<span style="border-bottom:2px solid ${color};background:${color}22" title="${esc(title)}">${esc(lastText.slice(m.start, m.end))}</span>`;
+    last = m.end;
+  }
+  html += esc(lastText.slice(last));
+  $("#highlight").innerHTML = html || '<span class="muted">无</span>';
+
+  if (!lastMentions.length) {
+    $("#mention-list").innerHTML = '<div class="muted">未识别到可链接的实体提及。</div>';
+    return;
+  }
+  $("#mention-list").innerHTML = lastMentions.map((m, i) => {
+    const badge = m.status === "linked"
+      ? `<span class="badge green">已链接</span>`
+      : `<span class="badge amber">待定</span>`;
+    const target = m.status === "linked"
+      ? `<b>${esc(m.canonical)}</b> <span class="muted">${ENTITY_SENSE_NAMES[m.sense_type] || ""} · 置信度 ${m.confidence}</span>`
+      : `<span class="muted">候选分差不足，暂不指派</span>`;
+    const cands = (m.candidates || []).map(c =>
+      `<div class="sub">　${esc(c.canonical)} <span class="muted">${ENTITY_SENSE_NAMES[c.sense_type] || ""}</span> 得分 ${c.score}</div>`).join("");
+    return `<div class="list-item"><div class="meta">
+      <div class="name">${esc(m.text)} ${badge} → ${target}</div>
+      <div class="sub">语境词：${(m.context || []).map(esc).join("、") || "无"}　领域：${(m.domains || []).join("、") || "无"}</div>
+      ${cands}
+    </div></div>`;
+  }).join("");
+}
+
+/* ---------- 语料入库与统计 ---------- */
+async function doIngest() {
+  const btn = $("#btn-ingest");
+  setLoading(btn, true, "入库中…");
+  try {
+    const r = await api("/api/entity/ingest", { method: "POST", body: {} });
+    $("#ingest-summary").textContent =
+      `新入库 ${r.docs} 篇（跳过 ${r.skipped}）：提及 ${r.mentions}，已链接 ${r.linked}，待定 ${r.pending}，新建实体 ${r.new_entities}`;
+    toast("语料入库完成");
+    loadEntities(); loadPending(); loadStats();
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+}
+
+async function loadStats() {
+  try {
+    const r = await api("/api/entity/stats");
+    $("#entity-stats").innerHTML =
+      `实体 <b>${r.entities.total}</b>（内置 ${r.entities.builtin} / 动态 ${r.entities.dynamic}）· ` +
+      `提及 <b>${r.mentions.total}</b>：已链接 <b>${r.mentions.linked}</b> / 待定 <b>${r.mentions.pending}</b> · 覆盖文档 ${r.mentions.docs} 篇`;
+  } catch (e) { /* ignore */ }
+}
+
+/* ---------- 实体库 ---------- */
+async function loadEntities() {
+  try {
+    const r = await api("/api/entities");
+    allEntities = r.entities.filter(e => !e.merged_into);
+    const list = $("#entity-list");
+    if (!allEntities.length) { list.innerHTML = '<span class="muted">暂无实体</span>'; return; }
+    list.innerHTML = allEntities.map(e => `
+      <div class="list-item" style="cursor:pointer" onclick="showEntity('${e.entity_id}')">
+        <div class="meta">
+          <div class="name">${esc(e.canonical)}
+            <span class="badge blue">${e.sense_name}</span>
+            ${e.source === "dynamic" ? '<span class="badge amber">动态</span>' : ""}
+          </div>
+          <div class="sub">别名：${e.aliases.map(esc).join("、") || "无"} · 提及 ${e.mention_count} 次</div>
+        </div>
+      </div>`).join("");
+  } catch (e) { /* ignore */ }
+}
+
+async function showEntity(eid) {
+  try {
+    const e = await api(`/api/entities/${eid}`);
+    $("#entity-detail-card").style.display = "";
+    $("#detail-title").textContent = `${e.canonical}（${e.sense_name}）`;
+    const mentions = (e.mentions || []).map(m => `
+      <div class="sub">・「${esc(m.text)}」 @ ${esc(m.doc_id || "未关联文档")} · ${fmtTime(m.created_at)}</div>`).join("");
+    $("#entity-detail").innerHTML = `
+      <p class="small">别名：${e.aliases.map(esc).join("、") || "无"}　领域：${(e.domains || []).join("、") || "无"}</p>
+      <p class="small">特征词：${Object.keys(e.cues || {}).slice(0, 12).map(esc).join("、") || "无"}</p>
+      <h3>跨文档提及（${(e.mentions || []).length} 条 / ${e.doc_count} 篇文档）</h3>
+      ${mentions || '<span class="muted small">暂无提及</span>'}`;
+    $("#entity-detail-card").scrollIntoView({ behavior: "smooth" });
+  } catch (e) { toast(e.message, "err"); }
+}
+
+/* ---------- 待定队列 ---------- */
+async function loadPending() {
+  try {
+    const r = await api("/api/entity/mentions?status=pending&limit=100");
+    const list = $("#pending-list");
+    $("#pending-count").textContent = `（${r.count}）`;
+    if (!r.mentions.length) { list.innerHTML = '<span class="muted">暂无待定提及</span>'; return; }
+    list.innerHTML = r.mentions.map(m => {
+      const options = (m.candidates || []).map(c =>
+        `<option value="${c.entity_id}">${esc(c.canonical)}（${ENTITY_SENSE_NAMES[c.sense_type] || ""} · 得分 ${c.score}）</option>`).join("");
+      const fallback = allEntities.map(e =>
+        `<option value="${e.entity_id}">${esc(e.canonical)}</option>`).join("");
+      return `<div class="list-item"><div class="meta">
+        <div class="name">「${esc(m.text)}」 <span class="muted">@ ${esc(m.doc_id || "未关联文档")}</span></div>
+        <div class="sub">语境词：${(m.context || []).map(esc).join("、") || "无"}</div>
+        </div>
+        <div class="row" style="align-items:center">
+          <select id="assign-${m.id}" style="max-width:260px">${options || fallback}</select>
+          <button class="btn small" onclick="assignMention('${m.id}')">指派</button>
+        </div>
+      </div>`;
+    }).join("");
+  } catch (e) { /* ignore */ }
+}
+
+async function assignMention(mid) {
+  const sel = $(`#assign-${mid}`);
+  if (!sel || !sel.value) return toast("没有可指派的实体", "err");
+  try {
+    await api(`/api/entities/${sel.value}/assign`, {
+      method: "POST", body: { mention_id: mid },
+    });
+    toast("已指派，实体画像已吸收该语境");
+    loadPending(); loadEntities(); loadStats();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function doReresolve() {
+  const btn = $("#btn-reresolve");
+  setLoading(btn, true, "重估中…");
+  try {
+    const r = await api("/api/entity/reresolve", { method: "POST", body: {} });
+    toast(`重估 ${r.checked} 条待定，升级 ${r.upgraded} 条`);
+    loadPending(); loadEntities(); loadStats();
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+}
+
+$("#btn-resolve").addEventListener("click", doResolve);
+$("#btn-ingest").addEventListener("click", doIngest);
+$("#btn-ent-refresh").addEventListener("click", () => { loadEntities(); loadStats(); });
+$("#btn-reresolve").addEventListener("click", doReresolve);
+
+loadEntities(); loadPending(); loadStats();
+doResolve();
+</script>
+</body>
+</html>

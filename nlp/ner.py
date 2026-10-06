@@ -15,7 +15,8 @@ import re
 from typing import Optional
 
 from .lexicon import (LOCATIONS, ORGANIZATIONS, PERSONS, SURNAMES,
-                      ORG_SUFFIXES, LOC_SUFFIXES, GIVEN_NAME_CHARS, load_dictionary)
+                      ORG_SUFFIXES, LOC_SUFFIXES, GIVEN_NAME_CHARS,
+                      STOPWORDS, load_dictionary)
 from .segmenter import Segmenter
 
 
@@ -122,6 +123,30 @@ class NERExtractor:
         # 常见称谓后缀，用于剔除「王先生」这类误报
         title_suffixes = ("先生", "女士", "小姐", "同志", "老师", "教授",
                           "博士", "经理", "局长", "主席", "书记")
+
+        # 相邻拼接：「星辰 / 公司」「明 / 月 / 公司」这类「专名 + 后缀词」
+        # 被分词拆开时，向前最多拼接两个连续的中文实词 token
+        for i, (word, start, end) in enumerate(tokens):
+            if i == 0:
+                continue
+            if word in ORG_SUFFIXES or word in LOC_SUFFIXES:
+                parts, j = [], i - 1
+                while j >= 0 and len(parts) < 2:
+                    prev = tokens[j][0]
+                    if (prev and sum(len(p) for p in parts) + len(prev) <= 6
+                            and all("一" <= c <= "鿿" for c in prev)
+                            and prev not in STOPWORDS
+                            and prev not in ORG_SUFFIXES
+                            and prev not in LOC_SUFFIXES):
+                        parts.insert(0, prev)
+                        j -= 1
+                    else:
+                        break
+                if parts:
+                    etype = "ORGANIZATION" if word in ORG_SUFFIXES else "LOCATION"
+                    results.append({"start": tokens[j + 1][1], "end": end,
+                                    "text": "".join(parts) + word,
+                                    "type": etype})
 
         for word, start, end in tokens:
             if end - start < 2:

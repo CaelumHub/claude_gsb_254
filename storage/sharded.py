@@ -255,6 +255,34 @@ class ShardedStore:
                 return False
         return True
 
+    # -- 更新 -------------------------------------------------------------
+    def update(self, record_id: str, patch: dict) -> bool:
+        """部分更新一条记录：把 ``patch`` 的字段合并进原记录。
+
+        与插入/删除一样走排他锁保护的读-改-写序列；记录不存在或已被
+        墓碑标记时返回 False。``id`` 字段不可被 patch 覆盖。
+        """
+        if not isinstance(patch, dict):
+            raise TypeError("patch 必须是 dict")
+        with FileLock(lock_path_for(self.meta_path)):
+            meta = self._read_meta()
+            for index in range(meta.get("shard_count", 0)):
+                path = self._shard_path(index)
+                with FileLock(lock_path_for(path)):
+                    records = self._read_shard(index)
+                    for i, record in enumerate(records):
+                        if record.get("id") == record_id:
+                            if record.get("_deleted"):
+                                return False
+                            merged = dict(record)
+                            merged.update(patch)
+                            merged["id"] = record_id
+                            merged["_updated"] = time.time()
+                            records[i] = merged
+                            self._write_shard(index, records)
+                            return True
+        return False
+
     # -- 删除（墓碑） -----------------------------------------------------
     def delete(self, record_id: str) -> bool:
         with FileLock(lock_path_for(self.meta_path)):

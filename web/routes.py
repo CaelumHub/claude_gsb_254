@@ -16,8 +16,10 @@ from flask import Blueprint, current_app, jsonify, request
 
 from nlp import (get_constituency_parser, get_embeddings, get_keywords, get_ner,
                  get_parser, get_segmenter, get_sentiment, get_summarizer,
-                 get_tagger, get_translator, ENTITY_TYPE_NAMES, TAG_NAMES,
+                 get_tagger, get_translator, get_entity_resolver,
+                 ENTITY_TYPE_NAMES, TAG_NAMES, SENSE_TYPE_NAMES,
                  DEP_REL_NAMES, PHRASE_NAMES, POLARITY_NAMES)
+from nlp.entitylink import BUILTIN_KB
 from nlp.lexicon import STOPWORDS
 from storage import StoreRegistry
 
@@ -110,6 +112,7 @@ def meta():
         "dep_rel_names": DEP_REL_NAMES,
         "phrase_names": PHRASE_NAMES,
         "entity_type_names": ENTITY_TYPE_NAMES,
+        "entity_sense_names": SENSE_TYPE_NAMES,
         "polarity_names": POLARITY_NAMES,
         "directions": [{"id": "zh2en", "name": "中文 → 英文"},
                        {"id": "en2zh", "name": "英文 → 中文"}],
@@ -287,6 +290,271 @@ def ner_annotate():
 def ner_annotations():
     records = _registry().task("annotation").all()
     return jsonify({"annotations": records})
+
+
+# ---------------------------------------------------------------------------
+# 实体消歧 / 链接 / 跨文档对齐
+# ---------------------------------------------------------------------------
+#
+# 存储布局（复用分片 JSON 存储）：
+# - ``entity`` 任务：规范实体记录（内置知识库 + 动态新建），id 即 entity_id，
+#   画像与特征词随链接增量更新；
+# - ``mention`` 任务：实体提及记录，含语境快照（context/domains/co_entities），
+#   status 为 linked / pending（待定）。已链接记录稳定不改判，
+#   待定记录可在知识库扩充后重估升级。
+
+def _entity_resolver():
+    """返回与 ``entity`` 存储同步过的实体对齐器（进程内单例）。"""
+    resolver = get_entity_resolver()
+    if not current_app.config.get("ENTITY_STORE_SYNCED"):
+        store = _registry().task("entity")
+        if not store.all():
+            # 首次使用：把内置知识库落库，保证 entity_id 跨重启稳定
+            store.insert_many([dict(e, id=e["entity_id"]) for e in BUILTIN_KB])
+        resolver.load_entries(
+            [r for r in store.all() if not r.get("_deleted")])
+        current_app.config["ENTITY_STORE_SYNCED"] = True
+    return resolver
+
+
+def _persist_entity_mutations(mutations: dict) -> None:
+    """把对齐器返回的变更集写入 ``entity`` 分片存储。"""
+    store = _registry().task("entity")
+    for entry in mutations.get("new_entities", []):
+        store.insert(dict(entry, id=entry["entity_id"]))
+    for entity_id, entry in mutations.get("updated_entities", {}).items():
+        store.update(entity_id, entry)
+
+
+def _entity_view(record: dict) -> dict:
+    return {
+        "entity_id": record.get("entity_id") or record.get("id"),
+        "canonical": record.get("canonical"),
+        "aliases": record.get("aliases", []),
+        "sense_type": record.get("sense_type"),
+        "sense_name": SENSE_TYPE_NAMES.get(record.get("sense_type"), "未知"),
+        "domains": record.get("domains", []),
+        "mention_count": record.get("mention_count", 0),
+        "source": record.get("source"),
+        "merged_into": record.get("merged_into"),
+    }
+
+
+@api.post("/entity/resolve")
+def entity_resolve():
+    """消歧并链接一段文本中的实体提及（结果持久化为 mention 记录）。"""
+    data = _payload()
+    text, cid = _resolve_text(data)
+    if not text:
+        return jsonify({"error": "缺少文本"}), 400
+    resolver = _entity_resolver()
+    doc_id = data.get("doc_id") or cid
+    result = resolver.resolve_document(text, doc_id=doc_id)
+    _persist_entity_mutations(result["mutations"])
+    mentions = result["mentions"]
+    if mentions and data.get("persist", True):
+        now = time.time()
+        ids = _registry().task("mention").insert_many(
+            [dict(m, created_at=now) for m in mentions])
+        for m, mid in zip(mentions, ids):
+            m["id"] = mid
+    result["sense_type_names"] = SENSE_TYPE_NAMES
+    return jsonify(result)
+
+
+@api.post("/entity/ingest")
+def entity_ingest():
+    """把语料库文档批量入库做实体对齐（幂等：已入库的文档默认跳过）。
+
+    同一对象散落在多篇文档时聚到同一 entity_id 下；同名不同对象各自
+    另立实体。已链接的关系不因新文档入库而改变。
+    """
+    data = _payload()
+    store = _registry().task("corpus")
+    corpus_ids = data.get("corpus_ids")
+    if corpus_ids:
+        records = [store.get(c) for c in corpus_ids]
+        records = [r for r in records if r and not r.get("_deleted")]
+    else:
+        records = [r for r in store.all() if not r.get("_deleted")]
+    if not records:
+        return jsonify({"error": "没有可处理的语料"}), 400
+
+    resolver = _entity_resolver()
+    mention_store = _registry().task("mention")
+    force = bool(data.get("force"))
+    summary = {"docs": 0, "skipped": 0, "mentions": 0,
+               "linked": 0, "pending": 0, "new_entities": 0}
+    for rec in records:
+        doc_id = rec["id"]
+        if not force and mention_store.query(
+                where=[("doc_id", "eq", doc_id)], limit=1):
+            summary["skipped"] += 1
+            continue
+        result = resolver.resolve_document(rec.get("text", ""), doc_id=doc_id)
+        _persist_entity_mutations(result["mutations"])
+        mentions = result["mentions"]
+        if mentions:
+            now = time.time()
+            mention_store.insert_many([dict(m, created_at=now) for m in mentions])
+        summary["docs"] += 1
+        summary["mentions"] += len(mentions)
+        summary["linked"] += sum(1 for m in mentions if m["status"] == "linked")
+        summary["pending"] += sum(1 for m in mentions if m["status"] == "pending")
+        summary["new_entities"] += len(result["mutations"]["new_entities"])
+    return jsonify({"ok": True, **summary})
+
+
+@api.get("/entities")
+def list_entities():
+    store = _registry().task("entity")
+    _entity_resolver()  # 确保已同步
+    items = [_entity_view(r) for r in store.all() if not r.get("_deleted")]
+    items.sort(key=lambda x: (x["merged_into"] is not None, -x["mention_count"]))
+    return jsonify({"entities": items, "sense_type_names": SENSE_TYPE_NAMES})
+
+
+@api.get("/entities/<eid>")
+def get_entity(eid: str):
+    resolver = _entity_resolver()
+    store = _registry().task("entity")
+    record = store.get(eid)
+    if not record or record.get("_deleted"):
+        return jsonify({"error": "实体不存在"}), 404
+    view = _entity_view(record)
+    view["cues"] = record.get("cues", {})
+    view["profile"] = record.get("profile", {})
+    view["related"] = record.get("related", [])
+    # 跨文档提及：沿重定向链取最终实体名下的所有提及
+    final = resolver.get_entry(eid)
+    final_id = final["entity_id"] if final else eid
+    mentions = _registry().task("mention").query(
+        where=[("entity_id", "eq", final_id)], order_by="created_at")
+    view["mentions"] = mentions
+    view["doc_count"] = len({m.get("doc_id") for m in mentions})
+    return jsonify(view)
+
+
+@api.get("/entity/mentions")
+def list_mentions():
+    where = []
+    for key in ("status", "doc_id", "entity_id"):
+        val = request.args.get(key)
+        if val:
+            where.append((key, "eq", val))
+    records = _registry().task("mention").query(
+        where=where or None, order_by="created_at", order="desc",
+        limit=request.args.get("limit", 200, type=int))
+    return jsonify({"mentions": records, "count": len(records)})
+
+
+@api.post("/entity/reresolve")
+def entity_reresolve():
+    """重估全部待定提及：知识库扩充后只升级、不改判已链接结果。"""
+    resolver = _entity_resolver()
+    mention_store = _registry().task("mention")
+    pending = mention_store.query(where=[("status", "eq", "pending")])
+    upgraded = 0
+    for rec in pending:
+        out = resolver.reresolve(rec)
+        if not out:
+            continue
+        _persist_entity_mutations(out["mutations"])
+        mention_store.update(rec["id"], {
+            "status": "linked", "entity_id": out["entity_id"],
+            "canonical": out["canonical"], "sense_type": out["sense_type"],
+            "score": out["score"], "margin": out["margin"],
+            "confidence": out["confidence"], "candidates": out["candidates"],
+            "reresolved": True,
+        })
+        upgraded += 1
+    return jsonify({"ok": True, "checked": len(pending), "upgraded": upgraded})
+
+
+@api.post("/entities/<eid>/assign")
+def entity_assign(eid: str):
+    """人工把一条（待定）提及指派给实体，画像加倍吸收该语境。"""
+    data = _payload()
+    mention_id = data.get("mention_id")
+    if not mention_id:
+        return jsonify({"error": "缺少 mention_id"}), 400
+    resolver = _entity_resolver()
+    entity_store = _registry().task("entity")
+    mention_store = _registry().task("mention")
+    entity = entity_store.get(eid)
+    mention = mention_store.get(mention_id)
+    if not entity or entity.get("_deleted") or entity.get("merged_into"):
+        return jsonify({"error": "实体不存在或已被合并"}), 404
+    if not mention or mention.get("_deleted"):
+        return jsonify({"error": "提及不存在"}), 404
+    mutations = resolver.manual_link(mention, eid)
+    _persist_entity_mutations(mutations)
+    mention_store.update(mention_id, {
+        "status": "linked", "entity_id": eid,
+        "canonical": entity.get("canonical"),
+        "sense_type": entity.get("sense_type"),
+        "confidence": 1.0, "source": "manual",
+    })
+    return jsonify({"ok": True})
+
+
+@api.post("/entities/<eid>/alias")
+def entity_add_alias(eid: str):
+    """给实体登记别名：同一对象的另一种叫法对上号。"""
+    data = _payload()
+    alias = (data.get("alias") or "").strip()
+    if not alias:
+        return jsonify({"error": "缺少别名"}), 400
+    resolver = _entity_resolver()
+    try:
+        mutations = resolver.add_alias(eid, alias)
+    except KeyError as exc:
+        return jsonify({"error": str(exc)}), 404
+    _persist_entity_mutations(mutations)
+    return jsonify({"ok": True})
+
+
+@api.post("/entities/merge")
+def entity_merge():
+    """显式合并两个实体：源实体的提及全部改挂目标，源留重定向。"""
+    data = _payload()
+    src_id, dst_id = data.get("src_id"), data.get("dst_id")
+    if not src_id or not dst_id:
+        return jsonify({"error": "缺少 src_id 或 dst_id"}), 400
+    resolver = _entity_resolver()
+    try:
+        mutations = resolver.merge_entities(src_id, dst_id)
+    except (KeyError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    _persist_entity_mutations(mutations)
+    dst = mutations["updated_entities"][dst_id]
+    mention_store = _registry().task("mention")
+    moved = 0
+    for m in mention_store.query(where=[("entity_id", "eq", src_id)]):
+        mention_store.update(m["id"], {
+            "entity_id": dst_id, "canonical": dst.get("canonical"),
+            "sense_type": dst.get("sense_type"), "merged_from": src_id,
+        })
+        moved += 1
+    return jsonify({"ok": True, "moved_mentions": moved})
+
+
+@api.get("/entity/stats")
+def entity_stats():
+    resolver = _entity_resolver()
+    mention_store = _registry().task("mention")
+    mentions = mention_store.all()
+    live = [m for m in mentions if not m.get("_deleted")]
+    return jsonify({
+        "entities": resolver.stats(),
+        "mentions": {
+            "total": len(live),
+            "linked": sum(1 for m in live if m.get("status") == "linked"),
+            "pending": sum(1 for m in live if m.get("status") == "pending"),
+            "docs": len({m.get("doc_id") for m in live}),
+        },
+        "sense_type_names": SENSE_TYPE_NAMES,
+    })
 
 
 # ---------------------------------------------------------------------------

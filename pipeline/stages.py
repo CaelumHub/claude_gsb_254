@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from nlp import (get_keywords, get_ner, get_parser, get_segmenter,
                  get_sentiment, get_summarizer, get_tagger, get_translator,
-                 get_constituency_parser)
+                 get_constituency_parser, get_entity_resolver)
 from nlp.lexicon import STOPWORDS
 
 from .stage import Stage
@@ -70,6 +70,16 @@ def _parse(ctx, params):
     return {"parse": {"dependency": dep, "constituency": const}}
 
 
+def _entity_link(ctx, params):
+    text = ctx.get("clean_text") or ctx.get("text", "")
+    resolver = get_entity_resolver()
+    result = resolver.resolve_document(
+        text, doc_id=ctx.get("doc_index"), mentions=ctx.get("ner"),
+        accept_score=params.get("accept_score", 3.5),
+        accept_margin=params.get("accept_margin", 1.5))
+    return {"entity_links": result["mentions"]}
+
+
 BUILTIN_STAGES = [
     Stage("clean", _clean, inputs=["text"], outputs=["clean_text"],
           description="文本清洗：去空白、去停用词", params={"remove_stopwords": True}),
@@ -89,4 +99,9 @@ BUILTIN_STAGES = [
           description="机器翻译（模拟）", params={"direction": "zh2en"}),
     Stage("parse", _parse, inputs=["text", "clean_text"], outputs=["parse"],
           description="句法分析"),
+    Stage("entity_link", _entity_link, inputs=["text", "clean_text", "ner"],
+          outputs=["entity_links"],
+          description="实体消歧与链接：结合搭配词 / 行业词 / 上下文实体，"
+                      "把实体提及对齐到知识库对象，拿不准标待定",
+          params={"accept_score": 3.5, "accept_margin": 1.5}),
 ]

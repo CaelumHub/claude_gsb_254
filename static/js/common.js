@@ -7,6 +7,7 @@ const PAGES = [
   { file: "segment.html",   name: "分词与词性标注", desc: "切词 + POS" },
   { file: "parse.html",     name: "句法分析树",   desc: "依存 / 成分树" },
   { file: "ner.html",       name: "命名实体识别", desc: "NER 与标注" },
+  { file: "entity.html",    name: "实体消歧对齐", desc: "消歧 · 链接 · 跨文档" },
   { file: "sentiment.html", name: "情感分析",     desc: "正负面分类" },
   { file: "summary.html",   name: "文本摘要",     desc: "抽取式摘要" },
   { file: "translate.html", name: "机器翻译",     desc: "模拟翻译" },
@@ -17,7 +18,8 @@ const PAGES = [
 
 const PAGE_NAMES = {
   corpus: "语料库管理", segment: "分词与词性标注", parse: "句法分析树",
-  ner: "命名实体识别", sentiment: "情感分析", summary: "文本摘要",
+  ner: "命名实体识别", entity: "实体消歧与对齐", sentiment: "情感分析",
+  summary: "文本摘要",
   translate: "机器翻译", keywords: "关键词提取", embedding: "词向量可视化",
   pipeline: "流水线配置与执行",
 };
@@ -32,6 +34,13 @@ const TAG_NAMES = {
 const ENTITY_NAMES = {
   PERSON: "人名", LOCATION: "地名", ORGANIZATION: "机构", TIME: "时间",
   DATE: "日期", NUMBER: "数字", MONEY: "金额", PERCENT: "百分比",
+};
+
+// 实体语义类别（与后端 /api/meta 的 entity_sense_names 一致）
+const ENTITY_SENSE_NAMES = {
+  COMPANY: "公司", ORG: "机构", BRAND: "品牌", PRODUCT: "产品",
+  PERSON: "人物", PLACE: "地点", FRUIT: "水果", GRAIN: "粮食",
+  UNKNOWN: "未知",
 };
 
 const DEP_REL_NAMES = {
